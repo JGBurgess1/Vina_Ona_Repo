@@ -76,26 +76,37 @@ Before running the large-scale docking campaign, optimize docking parameters
 using known actives and property-matched decoys (e.g., LUDe decoys).
 
 ```bash
-# Optimize box size, center, and exhaustiveness
+# Serial (single core):
 python run_optimize.py \
     --config config/optimize_example.yaml \
     --actives data/actives/ \
     --decoys data/decoys/
 
-# With iterative refinement (coarse grid → fine grid)
-python run_optimize.py \
+# MPI parallel — distribute parameter sets across 32 ranks:
+mpiexec -n 32 python run_optimize.py \
     --config config/optimize_example.yaml \
     --actives data/actives/ \
     --decoys data/decoys/ \
-    --refine 2
+    --mpi
 
-# Optimize for early enrichment instead of AUC
-python run_optimize.py \
+# MPI + iterative refinement (coarse grid → fine grid):
+mpiexec -n 32 python run_optimize.py \
     --config config/optimize_example.yaml \
     --actives data/actives/ \
     --decoys data/decoys/ \
-    --metric bedroc
+    --mpi --refine 2
+
+# Optimize for early enrichment instead of AUC:
+mpiexec -n 32 python run_optimize.py \
+    --config config/optimize_example.yaml \
+    --actives data/actives/ \
+    --decoys data/decoys/ \
+    --mpi --metric bedroc
 ```
+
+In MPI mode, parameter sets are distributed round-robin across ranks. Each rank
+independently computes affinity maps and docks all actives+decoys for its assigned
+configurations. Results are gathered to rank 0 for ranking and output.
 
 The optimizer:
 1. Generates a grid of parameter combinations (box size, center offsets, exhaustiveness)

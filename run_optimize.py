@@ -6,30 +6,41 @@ Evaluates docking parameter combinations (box size, center, exhaustiveness)
 by docking actives and decoys, computing ROC AUC and enrichment metrics,
 and selecting the configuration that best discriminates actives from decoys.
 
+Supports both serial and MPI-parallel execution. In MPI mode, parameter sets
+are distributed across ranks — each rank independently evaluates its assigned
+configurations, then results are gathered and ranked.
+
 The optimized parameters are written as a YAML config file compatible with
 run_docking.py (Vina MPI pipeline) and the results CSV is compatible with
 run_ml_pipeline.py (Vina ML Pipeline).
 
 Usage:
-    # Basic optimization:
+    # Serial (single core):
     python run_optimize.py \
         --config config/optimize_example.yaml \
         --actives data/actives/ \
         --decoys data/decoys/
 
-    # With iterative refinement (2 rounds):
-    python run_optimize.py \
+    # MPI parallel (distribute parameter sets across ranks):
+    mpiexec -n 32 python run_optimize.py \
         --config config/optimize_example.yaml \
         --actives data/actives/ \
         --decoys data/decoys/ \
-        --refine 2
+        --mpi
 
-    # Custom output:
-    python run_optimize.py \
+    # With iterative refinement (2 rounds):
+    mpiexec -n 32 python run_optimize.py \
         --config config/optimize_example.yaml \
         --actives data/actives/ \
         --decoys data/decoys/ \
-        --output-dir my_optimization/
+        --mpi --refine 2
+
+    # Custom metric and output:
+    mpiexec -n 32 python run_optimize.py \
+        --config config/optimize_example.yaml \
+        --actives data/actives/ \
+        --decoys data/decoys/ \
+        --mpi --metric bedroc --output-dir my_optimization/
 """
 
 import argparse
@@ -54,14 +65,17 @@ from optimizer.validation_docker import (
     ValidationResult,
     discover_ligands,
     run_optimization,
+    run_optimization_mpi,
 )
 
 
-def setup_logging(verbose: bool = False) -> None:
+def setup_logging(rank: int = 0, verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
+    if rank != 0:
+        level = logging.WARNING
     logging.basicConfig(
         level=level,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        format=f"%(asctime)s %(levelname)s [Rank {rank:03d}|%(name)s] %(message)s",
         datefmt="%H:%M:%S",
     )
 
@@ -81,6 +95,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoys", "-d", required=True,
         help="Directory containing decoy ligand PDBQT files (e.g., LUDe decoys)",
+    )
+    parser.add_argument(
+        "--mpi", action="store_true",
+        help="Enable MPI parallelism (distribute parameter sets across ranks)",
     )
     parser.add_argument(
         "--output-dir", "-o", default=None,
@@ -184,11 +202,11 @@ def write_docking_scores_csv(results: list, output_path: str) -> None:
             })
 
 
-def print_summary(results: list, metric_name: str) -> None:
+def print_summary(results: list, metric_name: str, n_ranks: int = 1) -> None:
     """Print optimization summary to stdout."""
     print(f"\n{'='*72}")
     print(f"DOCKING PARAMETER OPTIMIZATION RESULTS")
-    print(f"Optimized metric: {metric_name}")
+    print(f"Optimized metric: {metric_name} | MPI ranks: {n_ranks}")
     print(f"{'='*72}")
 
     print(f"\n  {'Rank':<5} {'AUC':<8} {'BEDROC':<8} {'LogAUC':<8} "
@@ -215,100 +233,149 @@ def print_summary(results: list, metric_name: str) -> None:
     print(f"{'='*72}\n")
 
 
+def _run_round(opt_config, param_sets, active_paths, decoy_paths, use_mpi, comm):
+    """Execute one optimization round (serial or MPI)."""
+    if use_mpi:
+        return run_optimization_mpi(
+            opt_config, param_sets, active_paths, decoy_paths, comm=comm,
+        )
+    else:
+        return run_optimization(
+            opt_config, param_sets, active_paths, decoy_paths,
+        )
+
+
 def main() -> int:
     args = parse_args()
-    setup_logging(args.verbose)
+
+    # Determine MPI rank before logging setup
+    rank = 0
+    size = 1
+    comm = None
+    if args.mpi:
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+
+    setup_logging(rank, args.verbose)
     logger = logging.getLogger(__name__)
 
     t_start = time.time()
 
     # ---------------------------------------------------------------
     # Phase 1: Load configuration and discover ligands
+    # Rank 0 handles file I/O; MPI bcast is done inside
+    # run_optimization_mpi().
     # ---------------------------------------------------------------
-    logger.info("Phase 1: Loading configuration and discovering ligands")
+    opt_config = None
+    active_paths = None
+    decoy_paths = None
 
-    opt_config = load_optimization_config(args.config)
-    if args.output_dir:
-        opt_config.output_dir = args.output_dir
-    if args.metric:
-        opt_config.metric = args.metric
-    if args.refine is not None:
-        opt_config.n_refinement_rounds = args.refine
+    if rank == 0:
+        logger.info("Phase 1: Loading configuration and discovering ligands")
+        if args.mpi:
+            logger.info("MPI mode: %d ranks available", size)
 
-    os.makedirs(opt_config.output_dir, exist_ok=True)
+        opt_config = load_optimization_config(args.config)
+        if args.output_dir:
+            opt_config.output_dir = args.output_dir
+        if args.metric:
+            opt_config.metric = args.metric
+        if args.refine is not None:
+            opt_config.n_refinement_rounds = args.refine
 
-    active_paths = discover_ligands(args.actives, args.pattern)
-    decoy_paths = discover_ligands(args.decoys, args.pattern)
+        os.makedirs(opt_config.output_dir, exist_ok=True)
 
-    logger.info(
-        "Found %d actives and %d decoys", len(active_paths), len(decoy_paths)
-    )
+        active_paths = discover_ligands(args.actives, args.pattern)
+        decoy_paths = discover_ligands(args.decoys, args.pattern)
+
+        logger.info(
+            "Found %d actives and %d decoys", len(active_paths), len(decoy_paths)
+        )
 
     # ---------------------------------------------------------------
     # Phase 2: Generate parameter grid and run optimization
     # ---------------------------------------------------------------
-    logger.info("Phase 2: Parameter grid search")
+    param_sets = None
+    if rank == 0:
+        logger.info("Phase 2: Parameter grid search")
+        param_sets = generate_parameter_grid(opt_config)
 
-    param_sets = generate_parameter_grid(opt_config)
-    all_results = run_optimization(opt_config, param_sets, active_paths, decoy_paths)
+    all_results = _run_round(
+        opt_config, param_sets, active_paths, decoy_paths, args.mpi, comm,
+    )
 
     # ---------------------------------------------------------------
     # Phase 3: Iterative refinement (if configured)
+    # Rank 0 generates refined grids; all ranks participate in eval.
     # ---------------------------------------------------------------
-    for round_i in range(1, opt_config.n_refinement_rounds):
-        logger.info(
-            "Phase 3: Refinement round %d/%d",
-            round_i, opt_config.n_refinement_rounds - 1,
+    n_refinement_rounds = 1
+    if rank == 0 and opt_config is not None:
+        n_refinement_rounds = opt_config.n_refinement_rounds
+
+    if args.mpi:
+        n_refinement_rounds = comm.bcast(n_refinement_rounds, root=0)
+
+    for round_i in range(1, n_refinement_rounds):
+        refined_sets = None
+        if rank == 0:
+            logger.info(
+                "Phase 3: Refinement round %d/%d",
+                round_i, n_refinement_rounds - 1,
+            )
+            best_params = all_results[0].params
+            refined_sets = refine_around_best(
+                opt_config, best_params, zoom=opt_config.refinement_zoom,
+            )
+
+        refined_results = _run_round(
+            opt_config, refined_sets, active_paths, decoy_paths, args.mpi, comm,
         )
-        best_params = all_results[0].params
-        refined_sets = refine_around_best(
-            opt_config, best_params, zoom=opt_config.refinement_zoom
-        )
-        refined_results = run_optimization(
-            opt_config, refined_sets, active_paths, decoy_paths
-        )
-        # Merge and re-sort
-        all_results.extend(refined_results)
-        metric_key = opt_config.metric
-        all_results.sort(
-            key=lambda r: getattr(r.metrics, metric_key, r.metrics.roc_auc),
-            reverse=True,
-        )
+
+        if rank == 0:
+            all_results.extend(refined_results)
+            metric_key = opt_config.metric
+            all_results.sort(
+                key=lambda r: getattr(r.metrics, metric_key, r.metrics.roc_auc),
+                reverse=True,
+            )
 
     # ---------------------------------------------------------------
-    # Phase 4: Write outputs
+    # Phase 4: Write outputs (rank 0 only)
     # ---------------------------------------------------------------
-    logger.info("Phase 4: Writing results and generating plots")
+    if rank == 0 and all_results is not None:
+        logger.info("Phase 4: Writing results and generating plots")
 
-    # Optimization results CSV
-    results_csv = os.path.join(opt_config.output_dir, "optimization_results.csv")
-    write_results_csv(all_results, results_csv)
+        # Optimization results CSV
+        results_csv = os.path.join(opt_config.output_dir, "optimization_results.csv")
+        write_results_csv(all_results, results_csv)
 
-    # Per-ligand scores from best config (ML Pipeline compatible)
-    scores_csv = os.path.join(opt_config.output_dir, "best_docking_scores.csv")
-    write_docking_scores_csv(all_results, scores_csv)
+        # Per-ligand scores from best config (ML Pipeline compatible)
+        scores_csv = os.path.join(opt_config.output_dir, "best_docking_scores.csv")
+        write_docking_scores_csv(all_results, scores_csv)
 
-    # Optimized config YAML (run_docking.py compatible)
-    best_config_path = os.path.join(opt_config.output_dir, "optimized_config.yaml")
-    write_optimized_config(opt_config, all_results[0].params, best_config_path)
+        # Optimized config YAML (run_docking.py compatible)
+        best_config_path = os.path.join(opt_config.output_dir, "optimized_config.yaml")
+        write_optimized_config(opt_config, all_results[0].params, best_config_path)
 
-    # Plots
-    plot_dir = os.path.join(opt_config.output_dir, "plots")
-    generate_all_plots(all_results, plot_dir)
+        # Plots
+        plot_dir = os.path.join(opt_config.output_dir, "plots")
+        generate_all_plots(all_results, plot_dir)
 
-    # Summary
-    print_summary(all_results, opt_config.metric)
+        # Summary
+        print_summary(all_results, opt_config.metric, n_ranks=size)
 
-    t_end = time.time()
-    logger.info("Optimization complete in %.1fs", t_end - t_start)
+        t_end = time.time()
+        logger.info("Optimization complete in %.1fs", t_end - t_start)
 
-    print(f"Outputs:")
-    print(f"  Optimized config:  {best_config_path}")
-    print(f"    -> Use with: mpiexec -n 600 python run_docking.py --config {best_config_path}")
-    print(f"  Docking scores:    {scores_csv}")
-    print(f"    -> Use with: python run_ml_pipeline.py --scores {scores_csv} --smiles ligands.smi")
-    print(f"  Full results:      {results_csv}")
-    print(f"  Plots:             {plot_dir}/")
+        print(f"Outputs:")
+        print(f"  Optimized config:  {best_config_path}")
+        print(f"    -> Use with: mpiexec -n 600 python run_docking.py --config {best_config_path}")
+        print(f"  Docking scores:    {scores_csv}")
+        print(f"    -> Use with: python run_ml_pipeline.py --scores {scores_csv} --smiles ligands.smi")
+        print(f"  Full results:      {results_csv}")
+        print(f"  Plots:             {plot_dir}/")
 
     return 0
 

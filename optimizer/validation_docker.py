@@ -5,6 +5,10 @@ Docks known actives and property-matched decoys (e.g., LUDe decoys)
 against a receptor using a given parameter set, then computes
 enrichment metrics to evaluate discrimination quality.
 
+Supports both serial and MPI-parallel execution:
+  - Serial: run_optimization() — evaluates parameter sets one at a time
+  - MPI:    run_optimization_mpi() — distributes parameter sets across ranks
+
 Integrates directly with DockingEngine and DockingConfig from the
 Vina MPI pipeline.
 """
@@ -13,7 +17,7 @@ import glob
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Optional
 
 import numpy as np
@@ -36,6 +40,66 @@ class ValidationResult:
     n_active_failures: int
     n_decoy_failures: int
     wall_time: float
+
+
+def _to_serializable(result: ValidationResult) -> dict:
+    """Convert a ValidationResult to a pickle-safe dict for MPI transfer."""
+    return {
+        "params": result.params.to_dict(),
+        "metrics": {
+            "roc_auc": result.metrics.roc_auc,
+            "log_auc": result.metrics.log_auc,
+            "bedroc": result.metrics.bedroc,
+            "ef_1pct": result.metrics.ef_1pct,
+            "ef_5pct": result.metrics.ef_5pct,
+            "ef_10pct": result.metrics.ef_10pct,
+            "n_actives": result.metrics.n_actives,
+            "n_decoys": result.metrics.n_decoys,
+            "fpr": result.metrics.fpr.tolist() if result.metrics.fpr is not None else None,
+            "tpr": result.metrics.tpr.tolist() if result.metrics.tpr is not None else None,
+        },
+        "active_scores": result.active_scores.tolist(),
+        "decoy_scores": result.decoy_scores.tolist(),
+        "all_scores": result.all_scores.tolist(),
+        "all_labels": result.all_labels.tolist(),
+        "n_active_failures": result.n_active_failures,
+        "n_decoy_failures": result.n_decoy_failures,
+        "wall_time": result.wall_time,
+    }
+
+
+def _from_serializable(d: dict) -> ValidationResult:
+    """Reconstruct a ValidationResult from a serialized dict."""
+    params = ParameterSet(
+        center=d["params"]["center"],
+        box_size=d["params"]["box_size"],
+        exhaustiveness=d["params"]["exhaustiveness"],
+        label=d["params"]["label"],
+    )
+    m = d["metrics"]
+    metrics = EnrichmentMetrics(
+        roc_auc=m["roc_auc"],
+        log_auc=m["log_auc"],
+        bedroc=m["bedroc"],
+        ef_1pct=m["ef_1pct"],
+        ef_5pct=m["ef_5pct"],
+        ef_10pct=m["ef_10pct"],
+        n_actives=m["n_actives"],
+        n_decoys=m["n_decoys"],
+        fpr=np.array(m["fpr"]) if m["fpr"] is not None else None,
+        tpr=np.array(m["tpr"]) if m["tpr"] is not None else None,
+    )
+    return ValidationResult(
+        params=params,
+        metrics=metrics,
+        active_scores=np.array(d["active_scores"]),
+        decoy_scores=np.array(d["decoy_scores"]),
+        all_scores=np.array(d["all_scores"]),
+        all_labels=np.array(d["all_labels"]),
+        n_active_failures=d["n_active_failures"],
+        n_decoy_failures=d["n_decoy_failures"],
+        wall_time=d["wall_time"],
+    )
 
 
 def discover_ligands(directory: str, pattern: str = "*.pdbqt") -> list:
@@ -61,6 +125,7 @@ def dock_validation_set(
     params: ParameterSet,
     active_paths: list,
     decoy_paths: list,
+    mpi_rank: int = 0,
 ) -> ValidationResult:
     """
     Dock actives and decoys with a specific parameter set and compute metrics.
@@ -71,6 +136,9 @@ def dock_validation_set(
     t_start = time.time()
 
     DockingConfig, DockingEngine = _import_docking_engine()
+
+    # Per-rank maps directory to avoid file collisions in parallel execution
+    maps_dir = os.path.join(opt_config.output_dir, "maps", f"rank_{mpi_rank}")
 
     # Build DockingConfig for this parameter set
     dock_config = DockingConfig(
@@ -87,16 +155,16 @@ def dock_validation_set(
         seed=opt_config.seed,
         write_poses=opt_config.write_poses,
         output_dir=os.path.join(opt_config.output_dir, "poses"),
-        maps_dir=os.path.join(opt_config.output_dir, "maps"),
+        maps_dir=maps_dir,
     )
 
     # Initialize engine and prepare maps
-    engine = DockingEngine(dock_config, rank=0)
+    engine = DockingEngine(dock_config, rank=mpi_rank)
     map_prefix = engine.prepare_maps()
     engine.initialize(map_prefix)
 
     # Dock actives
-    logger.info("  Docking %d actives...", len(active_paths))
+    logger.info("  Rank %d: docking %d actives...", mpi_rank, len(active_paths))
     active_results = engine.dock_batch(active_paths)
     active_scores = []
     n_active_fail = 0
@@ -107,7 +175,7 @@ def dock_validation_set(
             n_active_fail += 1
 
     # Dock decoys
-    logger.info("  Docking %d decoys...", len(decoy_paths))
+    logger.info("  Rank %d: docking %d decoys...", mpi_rank, len(decoy_paths))
     decoy_results = engine.dock_batch(decoy_paths)
     decoy_scores = []
     n_decoy_fail = 0
@@ -119,7 +187,8 @@ def dock_validation_set(
 
     if n_active_fail > 0 or n_decoy_fail > 0:
         logger.warning(
-            "  Docking failures: %d actives, %d decoys", n_active_fail, n_decoy_fail
+            "  Rank %d: docking failures: %d actives, %d decoys",
+            mpi_rank, n_active_fail, n_decoy_fail,
         )
 
     active_scores = np.array(active_scores, dtype=np.float64)
@@ -142,8 +211,9 @@ def dock_validation_set(
 
     wall_time = time.time() - t_start
     logger.info(
-        "  %s: AUC=%.3f, BEDROC=%.3f, EF1%%=%.1f (%.1fs)",
-        params.label, metrics.roc_auc, metrics.bedroc, metrics.ef_1pct, wall_time,
+        "  Rank %d: %s — AUC=%.3f, BEDROC=%.3f, EF1%%=%.1f (%.1fs)",
+        mpi_rank, params.label, metrics.roc_auc, metrics.bedroc,
+        metrics.ef_1pct, wall_time,
     )
 
     return ValidationResult(
@@ -159,6 +229,23 @@ def dock_validation_set(
     )
 
 
+def _sort_results(results: list, metric_key: str) -> list:
+    """Sort results by target metric, descending (higher is better)."""
+    results.sort(
+        key=lambda r: getattr(r.metrics, metric_key, r.metrics.roc_auc),
+        reverse=True,
+    )
+    return results
+
+
+def _chunk_round_robin(items: list, n_chunks: int) -> list:
+    """Split items into n_chunks lists using round-robin assignment."""
+    chunks = [[] for _ in range(n_chunks)]
+    for i, item in enumerate(items):
+        chunks[i % n_chunks].append(item)
+    return chunks
+
+
 def run_optimization(
     opt_config: OptimizationConfig,
     param_sets: list,
@@ -166,7 +253,7 @@ def run_optimization(
     decoy_paths: list,
 ) -> list:
     """
-    Evaluate all parameter sets and return sorted results.
+    Evaluate all parameter sets serially and return sorted results.
 
     Args:
         opt_config: optimization configuration
@@ -194,11 +281,117 @@ def run_optimization(
     if not results:
         raise RuntimeError("All parameter sets failed")
 
-    # Sort by target metric (descending — higher is better for all metrics)
-    metric_key = opt_config.metric
-    results.sort(
-        key=lambda r: getattr(r.metrics, metric_key, r.metrics.roc_auc),
-        reverse=True,
+    return _sort_results(results, opt_config.metric)
+
+
+def run_optimization_mpi(
+    opt_config: OptimizationConfig,
+    param_sets: list,
+    active_paths: list,
+    decoy_paths: list,
+    comm=None,
+) -> Optional[list]:
+    """
+    Evaluate parameter sets in parallel across MPI ranks.
+
+    Distributes parameter sets evenly via scatter, each rank evaluates
+    its chunk independently, then results are gathered back to rank 0.
+
+    Args:
+        opt_config: optimization configuration
+        param_sets: list of ParameterSet to evaluate (only needed on rank 0)
+        active_paths: paths to active ligand PDBQT files
+        decoy_paths: paths to decoy ligand PDBQT files
+        comm: MPI communicator (if None, imports MPI.COMM_WORLD)
+
+    Returns:
+        Sorted list of ValidationResult on rank 0, None on other ranks.
+    """
+    from mpi4py import MPI
+
+    if comm is None:
+        comm = MPI.COMM_WORLD
+
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    # --- Broadcast shared data from rank 0 ---
+    if rank == 0:
+        bcast_data = {
+            "opt_config": opt_config,
+            "active_paths": active_paths,
+            "decoy_paths": decoy_paths,
+        }
+    else:
+        bcast_data = None
+
+    bcast_data = comm.bcast(bcast_data, root=0)
+    opt_config = bcast_data["opt_config"]
+    active_paths = bcast_data["active_paths"]
+    decoy_paths = bcast_data["decoy_paths"]
+
+    # --- Scatter parameter sets ---
+    if rank == 0:
+        chunks = _chunk_round_robin(param_sets, size)
+        logger.info(
+            "Distributing %d parameter sets across %d ranks (min=%d, max=%d per rank)",
+            len(param_sets), size,
+            min(len(c) for c in chunks),
+            max(len(c) for c in chunks),
+        )
+    else:
+        chunks = None
+
+    my_param_sets = comm.scatter(chunks, root=0)
+
+    logger.info(
+        "Rank %d: received %d parameter sets to evaluate", rank, len(my_param_sets)
     )
 
-    return results
+    # --- Each rank evaluates its parameter sets ---
+    my_results = []
+    for i, params in enumerate(my_param_sets):
+        logger.info(
+            "Rank %d: evaluating %d/%d — %s",
+            rank, i + 1, len(my_param_sets), params.label,
+        )
+        try:
+            result = dock_validation_set(
+                opt_config, params, active_paths, decoy_paths, mpi_rank=rank,
+            )
+            my_results.append(result)
+        except Exception as e:
+            logger.error("Rank %d: failed %s — %s", rank, params.label, e)
+            continue
+
+    n_success = len(my_results)
+    n_fail = len(my_param_sets) - n_success
+    logger.info(
+        "Rank %d: finished — %d success, %d failed", rank, n_success, n_fail
+    )
+
+    # --- Serialize for MPI transfer ---
+    my_serialized = [_to_serializable(r) for r in my_results]
+
+    # --- Gather all results to rank 0 ---
+    all_serialized_lists = comm.gather(my_serialized, root=0)
+
+    if rank == 0:
+        all_results = []
+        for result_list in all_serialized_lists:
+            for d in result_list:
+                all_results.append(_from_serializable(d))
+
+        total_success = len(all_results)
+        total_attempted = len(param_sets)
+        logger.info(
+            "Gathered results: %d/%d parameter sets succeeded",
+            total_success, total_attempted,
+        )
+
+        if not all_results:
+            raise RuntimeError("All parameter sets failed across all ranks")
+
+        return _sort_results(all_results, opt_config.metric)
+
+    return None
