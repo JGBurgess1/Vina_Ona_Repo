@@ -70,6 +70,56 @@ See `config/example.yaml`. Key parameters:
 - `results_failed.csv` — Failed ligands with error messages (for re-processing)
 - `output/poses/` — PDBQT files with docked poses (if `write_poses: true`)
 
+## Parameter Optimization (Pre-Campaign)
+
+Before running the large-scale docking campaign, optimize docking parameters
+using known actives and property-matched decoys (e.g., LUDe decoys).
+
+```bash
+# Optimize box size, center, and exhaustiveness
+python run_optimize.py \
+    --config config/optimize_example.yaml \
+    --actives data/actives/ \
+    --decoys data/decoys/
+
+# With iterative refinement (coarse grid → fine grid)
+python run_optimize.py \
+    --config config/optimize_example.yaml \
+    --actives data/actives/ \
+    --decoys data/decoys/ \
+    --refine 2
+
+# Optimize for early enrichment instead of AUC
+python run_optimize.py \
+    --config config/optimize_example.yaml \
+    --actives data/actives/ \
+    --decoys data/decoys/ \
+    --metric bedroc
+```
+
+The optimizer:
+1. Generates a grid of parameter combinations (box size, center offsets, exhaustiveness)
+2. Docks all actives and decoys for each combination
+3. Computes ROC AUC, BEDROC, LogAUC, and enrichment factors (EF1%, EF5%, EF10%)
+4. Optionally refines around the best parameters with a finer grid
+5. Outputs:
+   - `optimized_config.yaml` — feed directly into `run_docking.py`
+   - `best_docking_scores.csv` — compatible with [Vina_ML_Pipeline](https://github.com/JGBurgess1/Vina_ML_Pipeline)
+   - ROC curve overlays, score distributions, parameter sensitivity plots
+
+See `config/optimize_example.yaml` for configuration options.
+
+### End-to-End Workflow
+
+```
+┌─────────────────────────┐     ┌──────────────────────────┐     ┌─────────────────────────┐
+│  1. run_optimize.py     │────>│  2. run_docking.py       │────>│  3. run_ml_pipeline.py  │
+│  Actives + LUDe decoys  │     │  50k ligands x 600 cores │     │  Fingerprints + ML      │
+│  → optimized_config.yaml│     │  → results.csv           │     │  → model comparison     │
+└─────────────────────────┘     └──────────────────────────┘     └─────────────────────────┘
+     (this repo)                      (this repo)                  (Vina_ML_Pipeline repo)
+```
+
 ## Performance
 
 With `exhaustiveness=8` and typical drug-like molecules:
@@ -81,12 +131,19 @@ With `exhaustiveness=8` and typical drug-like molecules:
 
 ```
 vina-mpi-docking/
-├── run_docking.py          # Entry point
-├── docking_engine.py       # Vina wrapper (map prep, single-ligand docking)
-├── mpi_orchestrator.py     # MPI scatter/gather coordination
-├── input_handler.py        # Config parsing, ligand discovery, validation
-├── results_writer.py       # CSV output and summary
+├── run_docking.py              # MPI docking entry point
+├── run_optimize.py             # Parameter optimization entry point
+├── docking_engine.py           # Vina wrapper (map prep, single-ligand docking)
+├── mpi_orchestrator.py         # MPI scatter/gather coordination
+├── input_handler.py            # Config parsing, ligand discovery, validation
+├── results_writer.py           # CSV output and summary
+├── optimizer/
+│   ├── roc_metrics.py          # ROC AUC, BEDROC, LogAUC, enrichment factors
+│   ├── param_optimizer.py      # Parameter grid generation and refinement
+│   ├── validation_docker.py    # Dock actives+decoys, compute metrics
+│   └── optimization_plots.py   # ROC overlays, sensitivity plots, heatmaps
 ├── config/
-│   └── example.yaml        # Sample configuration
+│   ├── example.yaml            # Sample docking config
+│   └── optimize_example.yaml   # Sample optimization config
 └── requirements.txt
 ```

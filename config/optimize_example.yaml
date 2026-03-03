@@ -1,0 +1,57 @@
+# Docking parameter optimization configuration
+#
+# Workflow:
+#   1. Prepare actives (known binders) and decoys (LUDe property-matched)
+#   2. Run: python run_optimize.py --config config/optimize_example.yaml \
+#                                  --actives data/actives/ --decoys data/decoys/
+#   3. Use the output optimized_config.yaml with run_docking.py for the full campaign
+#   4. Feed best_docking_scores.csv into run_ml_pipeline.py for ML training
+
+# Receptor
+receptor: /path/to/receptor.pdbqt
+
+# Starting search box center (Angstroms) - active site coordinates
+base_center: [15.190, 53.903, 16.917]
+
+# Starting search box dimensions (Angstroms)
+base_box_size: [20.0, 20.0, 20.0]
+
+# Scoring function: vina, vinardo, or ad4
+scoring_function: vina
+spacing: 0.375
+n_poses: 1    # only need best pose for scoring
+seed: 42
+
+# -------------------------------------------------------------------
+# Parameter search ranges
+# -------------------------------------------------------------------
+
+# Box size: try cubic boxes from 16 to 28 Angstroms in steps of 4
+box_size_range:
+  min: 16
+  max: 28
+  step: 4
+
+# Center offsets: try shifting the center +/- 2 Angstroms in each dimension
+# step=2 gives a 3x3x3 = 27 center grid
+center_offsets:
+  range: 2.0
+  step: 2.0
+
+# Exhaustiveness values to compare
+exhaustiveness_values: [8, 16, 32]
+
+# -------------------------------------------------------------------
+# Optimization settings
+# -------------------------------------------------------------------
+
+# Metric to maximize: roc_auc, bedroc, log_auc, ef_1pct, ef_5pct
+metric: roc_auc
+
+# Refinement: 1 = single grid search, 2 = grid + one refinement round, etc.
+n_refinement_rounds: 2
+refinement_zoom: 0.5
+
+# Output
+output_dir: optimization_results
+write_poses: false   # set true to save docked poses (uses more disk)
