@@ -1,6 +1,8 @@
 # Vina MPI Docking
 
 Parallel molecular docking of large compound libraries using AutoDock Vina and MPI.
+Includes parameter optimization, consensus docking with multiple tools, and
+integration with the [Vina_ML_Pipeline](https://github.com/JGBurgess1/Vina_ML_Pipeline).
 
 ## Architecture
 
@@ -124,12 +126,71 @@ See `config/optimize_example.yaml` for configuration options.
 
 ```
 ┌─────────────────────────┐     ┌──────────────────────────┐     ┌─────────────────────────┐
-│  1. run_optimize.py     │────>│  2. run_docking.py       │────>│  3. run_ml_pipeline.py  │
+│  1. run_optimize.py     │────>│  2. run_docking.py       │────>│  4. run_ml_pipeline.py  │
 │  Actives + LUDe decoys  │     │  50k ligands x 600 cores │     │  Fingerprints + ML      │
 │  → optimized_config.yaml│     │  → results.csv           │     │  → model comparison     │
-└─────────────────────────┘     └──────────────────────────┘     └─────────────────────────┘
-     (this repo)                      (this repo)                  (Vina_ML_Pipeline repo)
+└─────────────────────────┘     └──────────┬───────────────┘     └─────────────────────────┘
+     (this repo)                           │                       (Vina_ML_Pipeline repo)
+                                           ▼
+                                ┌──────────────────────────┐
+                                │  3. run_consensus.py     │────>  also feeds Stage 4
+                                │  Vina + Smina + GNINA +  │
+                                │  rDock → consensus ranks  │
+                                └──────────────────────────┘
 ```
+
+## Consensus Docking
+
+Dock the same ligand library with multiple open-source tools and combine results
+using consensus scoring. Compounds that rank well across multiple tools are more
+likely to be true binders.
+
+### Supported Tools
+
+| Tool | Type | Score | Notes |
+|---|---|---|---|
+| **AutoDock Vina** | Empirical | kcal/mol | Python API or CLI |
+| **Smina** | Empirical (Vina fork) | kcal/mol | Custom scoring functions (vinardo) |
+| **GNINA** | CNN + Empirical | CNN affinity | Neural network rescoring of Vina poses |
+| **rDock** | Cavity-based | SCORE | Different algorithm, good for consensus diversity |
+
+### Consensus Methods
+
+| Method | Description |
+|---|---|
+| **Average Rank** | Average fractional rank across tools. Lower = better. |
+| **Z-Score Average** | Normalize each tool's scores to Z-scores, then average. |
+| **ECR** | Exponential Consensus Ranking — emphasizes top-ranked compounds. |
+| **Best-of-N** | Best Z-normalized score from any tool. |
+| **Majority Vote** | Count of tools ranking a ligand in the top X%. |
+
+### Running
+
+```bash
+# Serial
+python run_consensus.py \
+    --config config/consensus_example.yaml \
+    --ligands /data/ligands/
+
+# MPI parallel (ligands distributed across ranks)
+mpiexec -n 64 python run_consensus.py \
+    --config config/consensus_example.yaml \
+    --ligands /data/ligands/ \
+    --mpi
+
+# Specific backends only
+mpiexec -n 64 python run_consensus.py \
+    --config config/consensus_example.yaml \
+    --ligands /data/ligands/ \
+    --mpi --backends vina smina gnina
+
+# Use optimized config from Stage 1
+python run_consensus.py \
+    --config optimization_results/optimized_config.yaml \
+    --ligands /data/ligands/
+```
+
+See `config/consensus_example.yaml` for backend-specific options.
 
 ## Performance
 
@@ -144,6 +205,7 @@ With `exhaustiveness=8` and typical drug-like molecules:
 vina-mpi-docking/
 ├── run_docking.py              # MPI docking entry point
 ├── run_optimize.py             # Parameter optimization entry point
+├── run_consensus.py            # Consensus docking entry point
 ├── docking_engine.py           # Vina wrapper (map prep, single-ligand docking)
 ├── mpi_orchestrator.py         # MPI scatter/gather coordination
 ├── input_handler.py            # Config parsing, ligand discovery, validation
@@ -153,8 +215,19 @@ vina-mpi-docking/
 │   ├── param_optimizer.py      # Parameter grid generation and refinement
 │   ├── validation_docker.py    # Dock actives+decoys, compute metrics
 │   └── optimization_plots.py   # ROC overlays, sensitivity plots, heatmaps
+├── consensus/
+│   ├── backends/
+│   │   ├── base.py             # Abstract DockingBackend interface
+│   │   ├── vina_backend.py     # AutoDock Vina (Python API + CLI fallback)
+│   │   ├── smina_backend.py    # Smina (CLI, vinardo scoring)
+│   │   ├── gnina_backend.py    # GNINA (CLI, CNN + Vina scoring)
+│   │   └── rdock_backend.py    # rDock (CLI, cavity-based)
+│   ├── consensus_scoring.py    # 5 consensus methods (RbR, Z-score, ECR, Best-of-N, voting)
+│   ├── consensus_plots.py      # Rank correlations, score distributions, overlap analysis
+│   └── mpi_consensus.py        # MPI scatter/gather for parallel consensus
 ├── config/
 │   ├── example.yaml            # Sample docking config
-│   └── optimize_example.yaml   # Sample optimization config
+│   ├── optimize_example.yaml   # Sample optimization config
+│   └── consensus_example.yaml  # Sample consensus config
 └── requirements.txt
 ```

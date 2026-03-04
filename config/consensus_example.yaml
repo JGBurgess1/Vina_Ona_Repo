@@ -1,0 +1,37 @@
+# Consensus docking configuration
+#
+# Runs multiple docking tools on the same ligand library and combines
+# results using consensus scoring methods.
+#
+# Usage:
+#   python run_consensus.py --config config/consensus_example.yaml --ligands /data/ligands/
+#   mpiexec -n 64 python run_consensus.py --config config/consensus_example.yaml --ligands /data/ligands/ --mpi
+#
+# You can also use an optimized_config.yaml from run_optimize.py directly:
+#   python run_consensus.py --config optimization_results/optimized_config.yaml --ligands /data/ligands/
+
+# Receptor and search box (shared across all tools)
+receptor: /path/to/receptor.pdbqt
+center: [15.190, 53.903, 16.917]
+box_size: [20.0, 20.0, 20.0]
+
+# Docking parameters
+exhaustiveness: 8
+n_poses: 1
+seed: 42
+scoring_function: vina
+
+# Backend-specific options
+backend_options:
+  # Smina: alternative scoring function
+  smina_scoring: vinardo    # vinardo, custom, or default (vina)
+
+  # GNINA: CNN scoring mode
+  gnina_cnn_scoring: rescore  # rescore (fast), refinement (slow), none (Vina only)
+
+  # rDock: requires MOL2 receptor and optionally a reference ligand
+  # rdock_receptor_mol2: /path/to/receptor.mol2
+  # rdock_reference_ligand: /path/to/reference.sd
+  # rdock_cavity_radius: 6.0
+  # rdock_prm_file: /path/to/existing_cavity.prm  # skip cavity generation
+  # rdock_protocol: dock.prm
