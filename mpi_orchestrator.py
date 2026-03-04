@@ -18,6 +18,7 @@ from typing import Optional
 from mpi4py import MPI
 
 from docking_engine import DockingConfig, DockingEngine, DockingResult
+from logging_config import ProgressTracker
 
 logger = logging.getLogger(__name__)
 
@@ -88,23 +89,26 @@ class MPIOrchestrator:
         engine = DockingEngine(self.config, rank=self.rank)
         engine.initialize(map_prefix)
 
-        t_dock_start = time.time()
-        my_results = engine.dock_batch(my_ligands)
-        t_dock_end = time.time()
+        tracker = ProgressTracker(
+            total=len(my_ligands),
+            label="Docking",
+            rank=self.rank,
+        )
 
-        # Convert to serializable dicts for MPI gather
-        my_result_dicts = [asdict(r) for r in my_results]
+        t_dock_start = time.time()
+        my_results = []
+        for i, ligand_path in enumerate(my_ligands):
+            result = engine.dock_ligand(ligand_path)
+            my_results.append(result)
+            tracker.update(i + 1)
+        t_dock_end = time.time()
 
         n_success = sum(1 for r in my_results if r.success)
         n_fail = len(my_results) - n_success
-        logger.info(
-            "Rank %d: finished docking %d ligands (success=%d, failed=%d) in %.1fs",
-            self.rank,
-            len(my_results),
-            n_success,
-            n_fail,
-            t_dock_end - t_dock_start,
-        )
+        tracker.finish(n_success=n_success, n_failed=n_fail)
+
+        # Convert to serializable dicts for MPI gather
+        my_result_dicts = [asdict(r) for r in my_results]
 
         # --- Phase 4: Gather results ---
         all_result_lists = self.comm.gather(my_result_dicts, root=0)

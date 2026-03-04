@@ -53,6 +53,7 @@ from consensus.backends.rdock_backend import RDockBackend
 from consensus.consensus_scoring import compute_all_consensus
 from consensus.consensus_plots import generate_all_plots
 from consensus.mpi_consensus import run_consensus_serial, run_consensus_mpi
+from logging_config import configure_logging, log_config_summary, log_final_summary, log_phase
 
 
 # Registry of available backends
@@ -62,17 +63,6 @@ BACKEND_REGISTRY = {
     "gnina": GninaBackend,
     "rdock": RDockBackend,
 }
-
-
-def setup_logging(rank: int = 0, verbose: bool = False) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    if rank != 0:
-        level = logging.WARNING
-    logging.basicConfig(
-        level=level,
-        format=f"%(asctime)s %(levelname)s [Rank {rank:03d}|%(name)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,6 +107,10 @@ def parse_args() -> argparse.Namespace:
         help="Sigma for ECR scoring (default: 0.05)",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument(
+        "--log-dir", default="logs",
+        help="Directory for log files (default: logs)",
+    )
     return parser.parse_args()
 
 
@@ -248,7 +242,13 @@ def main() -> int:
         rank = comm.Get_rank()
         size = comm.Get_size()
 
-    setup_logging(rank, args.verbose)
+    configure_logging(
+        log_dir=args.log_dir,
+        log_name="consensus_docking",
+        rank=rank,
+        mpi_size=size,
+        verbose=args.verbose,
+    )
     logger = logging.getLogger(__name__)
 
     t_start = time.time()
@@ -261,9 +261,7 @@ def main() -> int:
     backend_config = None
 
     if rank == 0:
-        logger.info("Phase 1: Setup")
-        if args.mpi:
-            logger.info("MPI mode: %d ranks", size)
+        log_phase(logger, 1, "Load config, discover ligands, create backends")
 
         raw_config = load_config(args.config)
         os.makedirs(args.output_dir, exist_ok=True)
@@ -289,15 +287,22 @@ def main() -> int:
         return 1
 
     if rank == 0:
-        logger.info(
-            "Enabled backends: %s", ", ".join(b.name for b in backends)
+        enabled_names = [b.name for b in backends]
+        log_config_summary(
+            logger,
+            backends=", ".join(enabled_names),
+            ligands=len(ligand_paths) if ligand_paths else "N/A",
+            mpi_ranks=size,
+            vote_fraction=args.vote_fraction,
+            ecr_sigma=args.ecr_sigma,
+            output_dir=args.output_dir,
         )
 
     # ---------------------------------------------------------------
     # Phase 2: Run docking with all backends
     # ---------------------------------------------------------------
     if rank == 0:
-        logger.info("Phase 2: Consensus docking")
+        log_phase(logger, 2, "Consensus docking")
 
     if args.mpi:
         all_results = run_consensus_mpi(backends, ligand_paths, comm=comm)
@@ -308,7 +313,7 @@ def main() -> int:
     # Phase 3: Compute consensus scores (rank 0 only)
     # ---------------------------------------------------------------
     if rank == 0 and all_results is not None:
-        logger.info("Phase 3: Computing consensus scores")
+        log_phase(logger, 3, "Computing consensus scores")
 
         # Build ligand name list
         from consensus.consensus_scoring import _ligand_key
@@ -323,7 +328,7 @@ def main() -> int:
         # ---------------------------------------------------------------
         # Phase 4: Write outputs and generate plots
         # ---------------------------------------------------------------
-        logger.info("Phase 4: Writing results and generating plots")
+        log_phase(logger, 4, "Writing results and generating plots")
 
         # Full consensus CSV
         consensus_csv = os.path.join(args.output_dir, "consensus_results.csv")
@@ -341,7 +346,16 @@ def main() -> int:
         print_summary(consensus_df, score_matrix, n_ranks=size)
 
         t_end = time.time()
-        logger.info("Consensus docking complete in %.1fs", t_end - t_start)
+        tools_used = score_matrix.columns.tolist()
+        log_final_summary(
+            logger,
+            program="Consensus Docking",
+            wall_time=t_end - t_start,
+            ligands_scored=len(consensus_df),
+            tools=", ".join(tools_used),
+            consensus_methods="avg_rank, z_score, ecr, best_of_n, majority_vote",
+            output_dir=args.output_dir,
+        )
 
         print(f"Outputs:")
         print(f"  Consensus results: {consensus_csv}")

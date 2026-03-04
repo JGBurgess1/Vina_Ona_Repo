@@ -25,21 +25,9 @@ from mpi4py import MPI
 
 from docking_engine import DockingConfig
 from input_handler import discover_ligands, discover_ligands_recursive, load_config, validate_inputs
+from logging_config import configure_logging, log_config_summary, log_final_summary, log_phase
 from mpi_orchestrator import MPIOrchestrator
 from results_writer import print_summary, write_results_csv
-
-
-def setup_logging(rank: int, verbose: bool = False) -> None:
-    """Configure logging. Only rank 0 logs to stdout at INFO; workers log at WARNING."""
-    level = logging.DEBUG if verbose else logging.INFO
-    if rank != 0:
-        level = logging.WARNING
-
-    logging.basicConfig(
-        level=level,
-        format=f"[Rank {rank:04d}] %(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,6 +64,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose logging on all ranks",
     )
+    parser.add_argument(
+        "--log-dir",
+        default="logs",
+        help="Directory for log files (default: logs)",
+    )
     return parser.parse_args()
 
 
@@ -85,7 +78,13 @@ def main() -> int:
     size = comm.Get_size()
 
     args = parse_args()
-    setup_logging(rank, args.verbose)
+    configure_logging(
+        log_dir=args.log_dir,
+        log_name="docking_campaign",
+        rank=rank,
+        mpi_size=size,
+        verbose=args.verbose,
+    )
     logger = logging.getLogger(__name__)
 
     # Only rank 0 handles input discovery and validation
@@ -93,8 +92,8 @@ def main() -> int:
     ligand_paths = None
 
     if rank == 0:
-        logger.info("MPI docking: %d ranks available", size)
         t_start = time.time()
+        log_phase(logger, 1, "Input discovery and validation")
 
         try:
             config = load_config(args.config)
@@ -120,27 +119,45 @@ def main() -> int:
             comm.Abort(1)
             return 1
 
-        logger.info(
-            "Found %d ligands, distributing across %d ranks (~%d per rank)",
-            len(ligand_paths),
-            size,
-            len(ligand_paths) // size,
+        log_config_summary(
+            logger,
+            mpi_ranks=size,
+            ligands=len(ligand_paths),
+            ligands_per_rank=f"~{len(ligand_paths) // size}",
+            receptor=config.receptor_pdbqt,
+            exhaustiveness=config.exhaustiveness,
+            scoring=config.scoring_function,
+            output=args.output,
         )
 
     # Broadcast config to all ranks
     config = comm.bcast(config, root=0)
 
     # Run the parallel docking
+    if rank == 0:
+        log_phase(logger, 2, "Parallel docking")
+
     orchestrator = MPIOrchestrator(config, ligand_paths)
     all_results = orchestrator.run()
 
     # Rank 0 writes output
     if rank == 0 and all_results is not None:
+        log_phase(logger, 3, "Writing results")
         write_results_csv(all_results, args.output)
         print_summary(all_results)
 
         t_end = time.time()
-        logger.info("Total wall time: %.1fs", t_end - t_start)
+        total_success = sum(1 for r in all_results if r["success"])
+        total_fail = len(all_results) - total_success
+        log_final_summary(
+            logger,
+            program="Docking Campaign",
+            wall_time=t_end - t_start,
+            total_ligands=len(all_results),
+            successful=total_success,
+            failed=total_fail,
+            output_file=args.output,
+        )
 
     return 0
 

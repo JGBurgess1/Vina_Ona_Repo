@@ -67,6 +67,7 @@ import time
 import numpy as np
 import yaml
 
+from logging_config import configure_logging, log_config_summary, log_final_summary, log_phase
 from optimizer.param_optimizer import (
     OptimizationConfig,
     generate_parameter_grid,
@@ -83,17 +84,6 @@ from optimizer.validation_docker import (
 )
 
 AVAILABLE_BACKENDS = ["vina", "smina", "gnina", "rdock"]
-
-
-def setup_logging(rank: int = 0, verbose: bool = False) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    if rank != 0:
-        level = logging.WARNING
-    logging.basicConfig(
-        level=level,
-        format=f"%(asctime)s %(levelname)s [Rank {rank:03d}|%(name)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -140,6 +130,10 @@ def parse_args() -> argparse.Namespace:
         help="Glob pattern for ligand files (default: *.pdbqt)",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument(
+        "--log-dir", default="logs",
+        help="Directory for log files (default: logs)",
+    )
     return parser.parse_args()
 
 
@@ -280,7 +274,13 @@ def main() -> int:
         rank = comm.Get_rank()
         size = comm.Get_size()
 
-    setup_logging(rank, args.verbose)
+    configure_logging(
+        log_dir=args.log_dir,
+        log_name="optimization",
+        rank=rank,
+        mpi_size=size,
+        verbose=args.verbose,
+    )
     logger = logging.getLogger(__name__)
 
     t_start = time.time()
@@ -295,9 +295,7 @@ def main() -> int:
     decoy_paths = None
 
     if rank == 0:
-        logger.info("Phase 1: Loading configuration and discovering ligands")
-        if args.mpi:
-            logger.info("MPI mode: %d ranks available", size)
+        log_phase(logger, 1, "Load configuration and discover ligands")
 
         opt_config = load_optimization_config(args.config)
         if args.output_dir:
@@ -341,8 +339,15 @@ def _main_single_tool(args, opt_config, active_paths, decoy_paths,
     # Phase 2: Generate parameter grid and run optimization
     param_sets = None
     if rank == 0:
-        logger.info("Phase 2: Parameter grid search (Vina)")
+        log_phase(logger, 2, "Parameter grid search (Vina)")
         param_sets = generate_parameter_grid(opt_config)
+        log_config_summary(
+            logger,
+            parameter_sets=len(param_sets),
+            metric=opt_config.metric,
+            refinement_rounds=opt_config.n_refinement_rounds,
+            mpi_ranks=size,
+        )
 
     all_results = _run_round(
         opt_config, param_sets, active_paths, decoy_paths, args.mpi, comm,
@@ -359,9 +364,9 @@ def _main_single_tool(args, opt_config, active_paths, decoy_paths,
     for round_i in range(1, n_refinement_rounds):
         refined_sets = None
         if rank == 0:
-            logger.info(
-                "Phase 3: Refinement round %d/%d",
-                round_i, n_refinement_rounds - 1,
+            log_phase(
+                logger, 3,
+                f"Refinement round {round_i}/{n_refinement_rounds - 1}",
             )
             best_params = all_results[0].params
             refined_sets = refine_around_best(
@@ -382,7 +387,7 @@ def _main_single_tool(args, opt_config, active_paths, decoy_paths,
 
     # Phase 4: Write outputs (rank 0 only)
     if rank == 0 and all_results is not None:
-        logger.info("Phase 4: Writing results and generating plots")
+        log_phase(logger, 4, "Writing results and generating plots")
 
         results_csv = os.path.join(opt_config.output_dir, "optimization_results.csv")
         write_results_csv(all_results, results_csv)
@@ -399,7 +404,18 @@ def _main_single_tool(args, opt_config, active_paths, decoy_paths,
         print_summary(all_results, opt_config.metric, n_ranks=size)
 
         t_end = time.time()
-        logger.info("Optimization complete in %.1fs", t_end - t_start)
+        best = all_results[0]
+        log_final_summary(
+            logger,
+            program="Parameter Optimization (Vina)",
+            wall_time=t_end - t_start,
+            param_sets_evaluated=len(all_results),
+            best_roc_auc=f"{best.metrics.roc_auc:.4f}",
+            best_bedroc=f"{best.metrics.bedroc:.4f}",
+            best_box=best.params.box_size,
+            best_exhaustiveness=best.params.exhaustiveness,
+            output_dir=opt_config.output_dir,
+        )
 
         print(f"Outputs:")
         print(f"  Optimized config:  {best_config_path}")
@@ -431,11 +447,15 @@ def _main_multitool(args, opt_config, active_paths, decoy_paths,
     # Phase 2: Generate parameter grid
     param_sets = None
     if rank == 0:
+        log_phase(logger, 2, "Multi-tool parameter grid search")
         param_sets = generate_parameter_grid(opt_config)
-        logger.info(
-            "Phase 2: Multi-tool grid search — %d backends x %d param sets = %d jobs",
-            len(backend_names), len(param_sets),
-            len(backend_names) * len(param_sets),
+        log_config_summary(
+            logger,
+            backends=", ".join(backend_names),
+            parameter_sets=len(param_sets),
+            total_jobs=len(backend_names) * len(param_sets),
+            metric=opt_config.metric,
+            mpi_ranks=size,
         )
 
     # Run optimization
@@ -460,9 +480,9 @@ def _main_multitool(args, opt_config, active_paths, decoy_paths,
 
     for round_i in range(1, n_refinement_rounds):
         if rank == 0:
-            logger.info(
-                "Phase 3: Refinement round %d/%d",
-                round_i, n_refinement_rounds - 1,
+            log_phase(
+                logger, 3,
+                f"Refinement round {round_i}/{n_refinement_rounds - 1}",
             )
             # Refine around each tool's best params
             refined_sets_by_tool = {}
@@ -518,7 +538,7 @@ def _main_multitool(args, opt_config, active_paths, decoy_paths,
 
     # Phase 4: Write outputs (rank 0 only)
     if rank == 0 and results_by_tool is not None:
-        logger.info("Phase 4: Writing multi-tool results and plots")
+        log_phase(logger, 4, "Writing multi-tool results and plots")
 
         # Per-tool optimized configs and results CSVs
         for bname in backend_names:
@@ -551,7 +571,20 @@ def _main_multitool(args, opt_config, active_paths, decoy_paths,
         _print_multitool_summary(results_by_tool, opt_config.metric, n_ranks=size)
 
         t_end = time.time()
-        logger.info("Multi-tool optimization complete in %.1fs", t_end - t_start)
+        # Build summary kwargs for each tool's best result
+        summary_kwargs = {}
+        for bname in backend_names:
+            if results_by_tool.get(bname):
+                best = results_by_tool[bname][0]
+                summary_kwargs[f"{bname}_best_auc"] = f"{best.metrics.roc_auc:.4f}"
+                summary_kwargs[f"{bname}_sets_evaluated"] = len(results_by_tool[bname])
+        log_final_summary(
+            logger,
+            program="Multi-Tool Parameter Optimization",
+            wall_time=t_end - t_start,
+            backends=", ".join(backend_names),
+            **summary_kwargs,
+        )
 
         print(f"\nOutputs:")
         for bname in backend_names:
