@@ -41,6 +41,20 @@ Usage:
         --actives data/actives/ \
         --decoys data/decoys/ \
         --mpi --metric bedroc --output-dir my_optimization/
+
+    # Multi-tool optimization (optimize params for each backend independently):
+    mpiexec -n 64 python run_optimize.py \
+        --config config/optimize_example.yaml \
+        --actives data/actives/ \
+        --decoys data/decoys/ \
+        --mpi --backends vina smina gnina
+
+    # Optimize for consensus docking (outputs per-tool configs):
+    python run_optimize.py \
+        --config config/optimize_example.yaml \
+        --actives data/actives/ \
+        --decoys data/decoys/ \
+        --backends vina smina gnina rdock
 """
 
 import argparse
@@ -67,6 +81,8 @@ from optimizer.validation_docker import (
     run_optimization,
     run_optimization_mpi,
 )
+
+AVAILABLE_BACKENDS = ["vina", "smina", "gnina", "rdock"]
 
 
 def setup_logging(rank: int = 0, verbose: bool = False) -> None:
@@ -95,6 +111,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoys", "-d", required=True,
         help="Directory containing decoy ligand PDBQT files (e.g., LUDe decoys)",
+    )
+    parser.add_argument(
+        "--backends", "-b", nargs="+", default=None,
+        choices=AVAILABLE_BACKENDS,
+        help="Docking backends to optimize (default: Vina only). "
+             "When multiple backends are specified, each is optimized independently.",
     )
     parser.add_argument(
         "--mpi", action="store_true",
@@ -295,21 +317,38 @@ def main() -> int:
         )
 
     # ---------------------------------------------------------------
-    # Phase 2: Generate parameter grid and run optimization
+    # Branch: multi-tool or single-tool optimization
     # ---------------------------------------------------------------
+    use_multitool = args.backends is not None and len(args.backends) > 0
+
+    if use_multitool:
+        return _main_multitool(
+            args, opt_config, active_paths, decoy_paths,
+            rank, size, comm, t_start,
+        )
+    else:
+        return _main_single_tool(
+            args, opt_config, active_paths, decoy_paths,
+            rank, size, comm, t_start,
+        )
+
+
+def _main_single_tool(args, opt_config, active_paths, decoy_paths,
+                       rank, size, comm, t_start) -> int:
+    """Original single-tool (Vina) optimization path."""
+    logger = logging.getLogger(__name__)
+
+    # Phase 2: Generate parameter grid and run optimization
     param_sets = None
     if rank == 0:
-        logger.info("Phase 2: Parameter grid search")
+        logger.info("Phase 2: Parameter grid search (Vina)")
         param_sets = generate_parameter_grid(opt_config)
 
     all_results = _run_round(
         opt_config, param_sets, active_paths, decoy_paths, args.mpi, comm,
     )
 
-    # ---------------------------------------------------------------
-    # Phase 3: Iterative refinement (if configured)
-    # Rank 0 generates refined grids; all ranks participate in eval.
-    # ---------------------------------------------------------------
+    # Phase 3: Iterative refinement
     n_refinement_rounds = 1
     if rank == 0 and opt_config is not None:
         n_refinement_rounds = opt_config.n_refinement_rounds
@@ -341,29 +380,22 @@ def main() -> int:
                 reverse=True,
             )
 
-    # ---------------------------------------------------------------
     # Phase 4: Write outputs (rank 0 only)
-    # ---------------------------------------------------------------
     if rank == 0 and all_results is not None:
         logger.info("Phase 4: Writing results and generating plots")
 
-        # Optimization results CSV
         results_csv = os.path.join(opt_config.output_dir, "optimization_results.csv")
         write_results_csv(all_results, results_csv)
 
-        # Per-ligand scores from best config (ML Pipeline compatible)
         scores_csv = os.path.join(opt_config.output_dir, "best_docking_scores.csv")
         write_docking_scores_csv(all_results, scores_csv)
 
-        # Optimized config YAML (run_docking.py compatible)
         best_config_path = os.path.join(opt_config.output_dir, "optimized_config.yaml")
         write_optimized_config(opt_config, all_results[0].params, best_config_path)
 
-        # Plots
         plot_dir = os.path.join(opt_config.output_dir, "plots")
         generate_all_plots(all_results, plot_dir)
 
-        # Summary
         print_summary(all_results, opt_config.metric, n_ranks=size)
 
         t_end = time.time()
@@ -378,6 +410,236 @@ def main() -> int:
         print(f"  Plots:             {plot_dir}/")
 
     return 0
+
+
+def _main_multitool(args, opt_config, active_paths, decoy_paths,
+                     rank, size, comm, t_start) -> int:
+    """
+    Multi-tool optimization: optimize parameters for each backend independently.
+    Produces per-tool optimized configs and cross-tool comparison.
+    """
+    logger = logging.getLogger(__name__)
+
+    from optimizer.multitool_validator import (
+        run_multitool_optimization,
+        run_multitool_optimization_mpi,
+    )
+    from optimizer.multitool_plots import generate_multitool_plots
+
+    backend_names = args.backends
+
+    # Phase 2: Generate parameter grid
+    param_sets = None
+    if rank == 0:
+        param_sets = generate_parameter_grid(opt_config)
+        logger.info(
+            "Phase 2: Multi-tool grid search — %d backends x %d param sets = %d jobs",
+            len(backend_names), len(param_sets),
+            len(backend_names) * len(param_sets),
+        )
+
+    # Run optimization
+    if args.mpi:
+        results_by_tool = run_multitool_optimization_mpi(
+            opt_config, backend_names, param_sets,
+            active_paths, decoy_paths, comm=comm,
+        )
+    else:
+        results_by_tool = run_multitool_optimization(
+            opt_config, backend_names, param_sets,
+            active_paths, decoy_paths,
+        )
+
+    # Phase 3: Iterative refinement per tool
+    n_refinement_rounds = 1
+    if rank == 0 and opt_config is not None:
+        n_refinement_rounds = opt_config.n_refinement_rounds
+
+    if args.mpi:
+        n_refinement_rounds = comm.bcast(n_refinement_rounds, root=0)
+
+    for round_i in range(1, n_refinement_rounds):
+        if rank == 0:
+            logger.info(
+                "Phase 3: Refinement round %d/%d",
+                round_i, n_refinement_rounds - 1,
+            )
+            # Refine around each tool's best params
+            refined_sets_by_tool = {}
+            for bname in backend_names:
+                if results_by_tool[bname]:
+                    best = results_by_tool[bname][0].params
+                    refined = refine_around_best(
+                        opt_config, best, zoom=opt_config.refinement_zoom,
+                    )
+                    refined_sets_by_tool[bname] = refined
+
+            # Flatten into a single param_sets list for all tools
+            all_refined = []
+            refined_backend_names = []
+            for bname, rsets in refined_sets_by_tool.items():
+                all_refined.extend(rsets)
+                refined_backend_names.extend([bname] * len(rsets))
+        else:
+            all_refined = None
+            refined_backend_names = None
+
+        # For refinement, we need to run per-tool with their specific refined sets
+        # Reuse the multitool runner with the union of all refined sets
+        if rank == 0:
+            # Group refined sets per tool
+            refined_by_tool = {}
+            for bname in backend_names:
+                if bname in (refined_sets_by_tool if rank == 0 else {}):
+                    refined_by_tool[bname] = refined_sets_by_tool[bname]
+
+            # Run each tool's refinement with its own refined grid
+            for bname, rsets in refined_by_tool.items():
+                if args.mpi:
+                    from optimizer.multitool_validator import run_multitool_optimization_mpi
+                    refined_results = run_multitool_optimization_mpi(
+                        opt_config, [bname], rsets,
+                        active_paths, decoy_paths, comm=comm,
+                    )
+                else:
+                    from optimizer.multitool_validator import run_multitool_optimization
+                    refined_results = run_multitool_optimization(
+                        opt_config, [bname], rsets,
+                        active_paths, decoy_paths,
+                    )
+
+                if refined_results and bname in refined_results:
+                    results_by_tool[bname].extend(refined_results[bname])
+                    metric_key = opt_config.metric
+                    results_by_tool[bname].sort(
+                        key=lambda r: getattr(r.metrics, metric_key, r.metrics.roc_auc),
+                        reverse=True,
+                    )
+
+    # Phase 4: Write outputs (rank 0 only)
+    if rank == 0 and results_by_tool is not None:
+        logger.info("Phase 4: Writing multi-tool results and plots")
+
+        # Per-tool optimized configs and results CSVs
+        for bname in backend_names:
+            results = results_by_tool.get(bname, [])
+            if not results:
+                logger.warning("No results for %s", bname)
+                continue
+
+            # Per-tool results CSV
+            tool_csv = os.path.join(
+                opt_config.output_dir, f"optimization_results_{bname}.csv"
+            )
+            write_results_csv(results, tool_csv)
+
+            # Per-tool optimized config
+            tool_config_path = os.path.join(
+                opt_config.output_dir, f"optimized_config_{bname}.yaml"
+            )
+            write_optimized_config(opt_config, results[0].params, tool_config_path)
+
+        # Cross-tool comparison CSV
+        comparison_csv = os.path.join(opt_config.output_dir, "tool_comparison.csv")
+        _write_tool_comparison_csv(results_by_tool, comparison_csv)
+
+        # Plots
+        plot_dir = os.path.join(opt_config.output_dir, "plots")
+        generate_multitool_plots(results_by_tool, plot_dir)
+
+        # Summary
+        _print_multitool_summary(results_by_tool, opt_config.metric, n_ranks=size)
+
+        t_end = time.time()
+        logger.info("Multi-tool optimization complete in %.1fs", t_end - t_start)
+
+        print(f"\nOutputs:")
+        for bname in backend_names:
+            if results_by_tool.get(bname):
+                cfg = os.path.join(opt_config.output_dir, f"optimized_config_{bname}.yaml")
+                print(f"  {bname} config: {cfg}")
+        print(f"  Tool comparison:   {comparison_csv}")
+        print(f"  Plots:             {plot_dir}/")
+        print(f"\n  Use per-tool configs with run_consensus.py:")
+        print(f"    python run_consensus.py --config <tool_config> --ligands /data/ligands/")
+
+    return 0
+
+
+def _write_tool_comparison_csv(results_by_tool: dict, output_path: str) -> None:
+    """Write a side-by-side comparison of the best params per tool."""
+    fieldnames = [
+        "tool", "roc_auc", "log_auc", "bedroc",
+        "ef_1pct", "ef_5pct", "ef_10pct",
+        "box_size_x", "box_size_y", "box_size_z",
+        "center_x", "center_y", "center_z",
+        "exhaustiveness", "n_param_sets_evaluated",
+    ]
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for tool_name, results in results_by_tool.items():
+            if not results:
+                continue
+            best = results[0]
+            writer.writerow({
+                "tool": tool_name,
+                "roc_auc": f"{best.metrics.roc_auc:.4f}",
+                "log_auc": f"{best.metrics.log_auc:.4f}",
+                "bedroc": f"{best.metrics.bedroc:.4f}",
+                "ef_1pct": f"{best.metrics.ef_1pct:.2f}",
+                "ef_5pct": f"{best.metrics.ef_5pct:.2f}",
+                "ef_10pct": f"{best.metrics.ef_10pct:.2f}",
+                "box_size_x": best.params.box_size[0],
+                "box_size_y": best.params.box_size[1],
+                "box_size_z": best.params.box_size[2],
+                "center_x": best.params.center[0],
+                "center_y": best.params.center[1],
+                "center_z": best.params.center[2],
+                "exhaustiveness": best.params.exhaustiveness,
+                "n_param_sets_evaluated": len(results),
+            })
+
+
+def _print_multitool_summary(results_by_tool: dict, metric_name: str, n_ranks: int = 1) -> None:
+    """Print multi-tool optimization summary."""
+    print(f"\n{'='*78}")
+    print(f"MULTI-TOOL PARAMETER OPTIMIZATION RESULTS")
+    print(f"Optimized metric: {metric_name} | MPI ranks: {n_ranks}")
+    print(f"{'='*78}")
+
+    print(f"\n  {'Tool':<10} {'AUC':<8} {'BEDROC':<8} {'LogAUC':<8} "
+          f"{'EF1%':<7} {'Box':<18} {'Exh':<5} {'Evaluated':<10}")
+    print(f"  {'-'*10} {'-'*8} {'-'*8} {'-'*8} {'-'*7} {'-'*18} {'-'*5} {'-'*10}")
+
+    for tool_name, results in results_by_tool.items():
+        if not results:
+            print(f"  {tool_name:<10} (no results)")
+            continue
+        best = results[0]
+        m = best.metrics
+        bs = best.params.box_size
+        print(
+            f"  {tool_name:<10} {m.roc_auc:<8.4f} {m.bedroc:<8.4f} {m.log_auc:<8.4f} "
+            f"{m.ef_1pct:<7.1f} {bs[0]}x{bs[1]}x{bs[2]:<8} "
+            f"{best.params.exhaustiveness:<5} {len(results):<10}"
+        )
+
+    # Identify overall best tool
+    best_tool = None
+    best_metric = -1
+    for tool_name, results in results_by_tool.items():
+        if results:
+            val = getattr(results[0].metrics, metric_name, results[0].metrics.roc_auc)
+            if val > best_metric:
+                best_metric = val
+                best_tool = tool_name
+
+    if best_tool:
+        print(f"\n  BEST TOOL: {best_tool} ({metric_name}={best_metric:.4f})")
+
+    print(f"{'='*78}\n")
 
 
 if __name__ == "__main__":

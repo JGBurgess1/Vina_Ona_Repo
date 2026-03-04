@@ -83,6 +83,9 @@ class OptimizationConfig:
     output_dir: str = "optimization_results"
     write_poses: bool = False
 
+    # Backend-specific options (passed through to consensus backends)
+    backend_options: dict = field(default_factory=dict)
+
 
 def load_optimization_config(config_path: str) -> OptimizationConfig:
     """Load optimization configuration from YAML."""
@@ -146,6 +149,7 @@ def load_optimization_config(config_path: str) -> OptimizationConfig:
         refinement_zoom=raw.get("refinement_zoom", 0.5),
         output_dir=raw.get("output_dir", "optimization_results"),
         write_poses=raw.get("write_poses", False),
+        backend_options=raw.get("backend_options", {}),
     )
 
 

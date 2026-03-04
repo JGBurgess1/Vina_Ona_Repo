@@ -55,3 +55,14 @@ refinement_zoom: 0.5
 # Output
 output_dir: optimization_results
 write_poses: false   # set true to save docked poses (uses more disk)
+
+# -------------------------------------------------------------------
+# Backend-specific options (for multi-tool optimization)
+# Used when running: python run_optimize.py --backends vina smina gnina
+# -------------------------------------------------------------------
+backend_options:
+  smina_scoring: vinardo
+  gnina_cnn_scoring: rescore
+  # rdock_receptor_mol2: /path/to/receptor.mol2
+  # rdock_reference_ligand: /path/to/reference.sd
+  # rdock_cavity_radius: 6.0
